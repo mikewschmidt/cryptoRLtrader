@@ -16,10 +16,19 @@ python -c "import torch, numpy, pandas, yfinance, talib; print('All dependencies
 
 python testGPU.py
 
-python crypto_rl_trader.py train default 100 test_model.pth
+'''
+Episodes (Training Duration)
 
-#python main.py
+500-1000: Quick testing, basic models
+1000-2000: Standard production use
+3000-5000: High-performance models
+5000+: Research/experimental (diminishing returns)
+'''
 
+#python crypto_rl_trader.py train default 500 test_model.pth
+
+#python crypto_rl_trader.py train 1_months_of_days_of_crypto_1m.csv 2000 test_model.pth
+python crypto_rl_trader.py train 3_months_of_days_of_crypto_1m.csv 2000 RL_model_2000_3month.pth
 
 
 # Calculate the end time

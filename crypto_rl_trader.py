@@ -230,7 +230,8 @@ class TradingEnvironment:
             # +3 for position, balance ratio, steps since entry
             return np.zeros(self.data.shape[1] + 3)
 
-        market_state = self.data.iloc[self.current_step].values
+        # Exclude 'Close' price from market state
+        market_state = self.data.iloc[self.current_step].drop('Close').values
         position_state = np.array([
             self.position,
             self.balance / self.config.initial_balance,
@@ -558,7 +559,7 @@ class CryptoRLTrader:
 class RealTimeTrader:
     """Real-time trading implementation with live data using CCXT"""
 
-    def __init__(self, model_path: str, symbol: str = "BTC/USDT", exchange: str = "binance", config: TradingConfig = None):
+    def __init__(self, model_path: str, symbol: str = "BTC/USDT", exchange: str = "coinbase", config: TradingConfig = None):
         self.symbol = symbol
         self.exchange_name = exchange
         self.config = config or TradingConfig()
@@ -704,10 +705,10 @@ class RealTimeTrader:
         if len(processed_data) == 0:
             return None
 
-        # Get latest row features
-        latest_features = processed_data[self.feature_columns].iloc[-1].values
+        # Get latest row features and normalize
+        latest_features_df = processed_data[self.feature_columns].iloc[-1:]
         normalized_features = self.feature_engineer.normalize_features(
-            processed_data[self.feature_columns].iloc[-1:], self.feature_columns
+            latest_features_df, self.feature_columns
         )[0]
 
         # Add position state
@@ -838,7 +839,7 @@ class RealTimeTrader:
             print(f"Win Rate: {win_rate:.2%}")
 
 
-def fetch_crypto_data(symbol: str = "BTC/USDT", exchange_name: str = "binance", timeframe: str = "1m", days: int = 7) -> pd.DataFrame:
+def fetch_crypto_data(symbol: str = "BTC/USDT", exchange_name: str = "coinbase", timeframe: str = "1m", days: int = 7) -> pd.DataFrame:
     """Fetch cryptocurrency data using CCXT"""
     try:
         # Initialize exchange
@@ -968,6 +969,30 @@ def plot_results(trader: CryptoRLTrader, results: Dict):
     plt.show()
 
 
+def debug_dimensions(processed_data: pd.DataFrame, feature_columns: List[str]):
+    """Debug function to check dimensions"""
+    print(f"\n=== DIMENSION DEBUG ===")
+    print(f"Processed data shape: {processed_data.shape}")
+    print(f"Processed data columns: {processed_data.columns.tolist()}")
+    print(f"Feature columns count: {len(feature_columns)}")
+    print(f"Feature columns: {feature_columns}")
+
+    # Create sample feature dataframe like in training
+    normalized_features = np.random.randn(
+        len(processed_data), len(feature_columns))
+    feature_df = pd.DataFrame(normalized_features, columns=feature_columns)
+    feature_df['Close'] = processed_data['Close'].values
+
+    print(f"Feature dataframe shape: {feature_df.shape}")
+    print(f"Feature dataframe columns: {feature_df.columns.tolist()}")
+
+    # Check state dimensions
+    sample_row = feature_df.iloc[0].drop(['Close'])
+    print(f"Market state size (excluding Close): {len(sample_row)}")
+    print(f"Expected state size: {len(sample_row) + 3}")
+    print("======================\n")
+
+
 def main():
     """Main function to run the crypto trading RL model"""
     # Configuration
@@ -975,7 +1000,7 @@ def main():
 
     # Fetch data
     print("Fetching cryptocurrency data...")
-    raw_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 7)
+    raw_data = fetch_crypto_data("BTC/USDT", "coinbase", "1m", 7)
 
     if raw_data is None:
         print("Failed to fetch data. Exiting.")
@@ -1036,7 +1061,7 @@ def main():
 
     # Demonstrate continuous learning
     print("\nDemonstrating continuous learning...")
-    new_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 1)
+    new_data = fetch_crypto_data("BTC/USDT", "coinbase", "1m", 1)
     if new_data is not None:
         new_processed = feature_engineer.engineer_features(new_data)
         new_normalized = feature_engineer.normalize_features(
@@ -1044,7 +1069,7 @@ def main():
         new_feature_df = pd.DataFrame(new_normalized, columns=feature_columns)
         new_feature_df['Close'] = new_processed['Close'].values
 
-        trader.continuous_learning_update(new_feature_df)
+        trader.continuous_learning_update(new_feature_df, feature_columns)
         print("Model updated with new data!")
 
 
@@ -1064,10 +1089,10 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
         raw_data = load_user_data(user_data_path)
         if raw_data is None:
             print("Failed to load user data. Falling back to default data source.")
-            raw_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 7)
+            raw_data = fetch_crypto_data("BTC/USDT", "coinbase", "1m", 7)
     else:
         print("Fetching default cryptocurrency data...")
-        raw_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 7)
+        raw_data = fetch_crypto_data("BTC/USDT", "coinbase", "1m", 7)
 
     if raw_data is None:
         print("Failed to fetch data. Exiting.")
@@ -1081,6 +1106,9 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
     # Select feature columns
     feature_columns = [col for col in processed_data.columns
                        if col not in ['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+    # Debug dimensions
+    debug_dimensions(processed_data, feature_columns)
 
     # Normalize features
     normalized_features = feature_engineer.normalize_features(
@@ -1141,7 +1169,7 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
 # Live trading script function
 def run_live_trading(model_path: str = "crypto_rl_model.pth",
                      symbol: str = "BTC/USDT",
-                     exchange: str = "binance",
+                     exchange: str = "coinbase",
                      duration_minutes: int = 60):
     """Run live trading with trained model"""
     print("="*50)
@@ -1185,7 +1213,7 @@ if __name__ == "__main__":
         print(
             "  Live Trading: python crypto_rl_trader.py trade [model_file.pth] [symbol] [exchange] [duration_minutes]")
         print("  Example: python crypto_rl_trader.py train my_data.csv 1500")
-        print("  Example: python crypto_rl_trader.py trade crypto_rl_model.pth BTC/USDT binance 120")
+        print("  Example: python crypto_rl_trader.py trade crypto_rl_model.pth BTC/USDT coinbase 120")
         sys.exit(1)
 
     mode = sys.argv[1].lower()
@@ -1203,7 +1231,7 @@ if __name__ == "__main__":
         model_path = sys.argv[2] if len(
             sys.argv) > 2 else "crypto_rl_model.pth"
         symbol = sys.argv[3] if len(sys.argv) > 3 else "BTC/USDT"
-        exchange = sys.argv[4] if len(sys.argv) > 4 else "binance"
+        exchange = sys.argv[4] if len(sys.argv) > 4 else "coinbase"
         duration = int(sys.argv[5]) if len(sys.argv) > 5 else 60
 
         run_live_trading(model_path, symbol, exchange, duration)

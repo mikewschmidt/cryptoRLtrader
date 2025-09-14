@@ -1,0 +1,10 @@
+numpy 
+pandas 
+torch 
+torchvision 
+torchaudio
+matplotlib 
+scikit-learn 
+yfinance
+TA-Lib
+ccxt

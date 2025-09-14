@@ -16,7 +16,7 @@ python -c "import torch, numpy, pandas, yfinance, talib; print('All dependencies
 
 python testGPU.py
 
-python crypto_rl_trader.py train default 500 test_model.pth
+python crypto_rl_trader.py train default 100 test_model.pth
 
 #python main.py
 

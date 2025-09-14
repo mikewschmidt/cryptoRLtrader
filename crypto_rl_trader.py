@@ -14,7 +14,8 @@ from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 import talib
-import yfinance as yf
+import ccxt
+import time
 from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
@@ -555,12 +556,16 @@ class CryptoRLTrader:
 
 
 class RealTimeTrader:
-    """Real-time trading implementation with live data"""
+    """Real-time trading implementation with live data using CCXT"""
 
-    def __init__(self, model_path: str, symbol: str = "BTC-USD", config: TradingConfig = None):
+    def __init__(self, model_path: str, symbol: str = "BTC/USDT", exchange: str = "binance", config: TradingConfig = None):
         self.symbol = symbol
+        self.exchange_name = exchange
         self.config = config or TradingConfig()
         self.model_path = model_path
+
+        # Initialize CCXT exchange
+        self.exchange = self._initialize_exchange()
 
         # Initialize feature engineer
         self.feature_engineer = FeatureEngineer()
@@ -578,6 +583,43 @@ class RealTimeTrader:
         # Data buffer for feature calculation
         self.data_buffer = deque(maxlen=100)  # Keep last 100 minutes of data
 
+    def _initialize_exchange(self):
+        """Initialize CCXT exchange"""
+        try:
+            # Initialize exchange (using public data only)
+            exchange_class = getattr(ccxt, self.exchange_name)
+            exchange = exchange_class({
+                'apiKey': '',
+                'secret': '',
+                'timeout': 30000,
+                'enableRateLimit': True,
+                'sandbox': False,  # Set to True for testing
+            })
+
+            # Test connection
+            exchange.load_markets()
+            print(f"Connected to {self.exchange_name} exchange")
+            return exchange
+        except Exception as e:
+            print(f"Error initializing exchange: {e}")
+            # Fallback to other exchanges
+            for exchange_name in ['binance', 'coinbase', 'kraken']:
+                if exchange_name != self.exchange_name:
+                    try:
+                        exchange_class = getattr(ccxt, exchange_name)
+                        exchange = exchange_class({
+                            'timeout': 30000,
+                            'enableRateLimit': True,
+                        })
+                        exchange.load_markets()
+                        print(
+                            f"Connected to {exchange_name} exchange (fallback)")
+                        return exchange
+                    except:
+                        continue
+
+            raise Exception("Could not connect to any exchange")
+
     def load_model(self, feature_columns: List[str]):
         """Load the trained model"""
         self.feature_columns = feature_columns
@@ -588,18 +630,59 @@ class RealTimeTrader:
         self.trader.load_model(self.model_path)
         print(f"Loaded trained model from {self.model_path}")
 
-    def fetch_live_data(self) -> pd.DataFrame:
-        """Fetch the latest 1-minute data"""
+    def fetch_live_data(self, timeframe='1m', limit=2) -> pd.DataFrame:
+        """Fetch the latest OHLCV data using CCXT"""
         try:
-            ticker = yf.Ticker(self.symbol)
-            # Get last 2 minutes to ensure we have the latest complete minute
-            data = ticker.history(period="2d", interval="1m").tail(2)
-            data.reset_index(inplace=True)
-            data.columns = ['Datetime', 'Open',
-                            'High', 'Low', 'Close', 'Volume']
-            return data.iloc[-1:]  # Return only the latest complete minute
+            # Fetch OHLCV data
+            ohlcv = self.exchange.fetch_ohlcv(
+                self.symbol, timeframe, limit=limit)
+
+            if not ohlcv:
+                return None
+
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+
+            # Convert timestamp to datetime
+            df['Datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            # Drop timestamp column and reorder
+            df = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+            return df.tail(1)  # Return only the latest complete candle
+
         except Exception as e:
             print(f"Error fetching live data: {e}")
+            return None
+
+    def fetch_historical_data(self, timeframe='1m', days=1) -> pd.DataFrame:
+        """Fetch historical data for warmup"""
+        try:
+            # Calculate the start timestamp
+            since = self.exchange.milliseconds() - (days * 24 * 60 * 60 * 1000)
+
+            # Fetch historical data
+            ohlcv = self.exchange.fetch_ohlcv(
+                self.symbol, timeframe, since=since)
+
+            if not ohlcv:
+                return None
+
+            # Convert to DataFrame
+            df = pd.DataFrame(
+                ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+
+            # Convert timestamp to datetime
+            df['Datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            # Drop timestamp column and reorder
+            df = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+            return df
+
+        except Exception as e:
+            print(f"Error fetching historical data: {e}")
             return None
 
     def update_data_buffer(self, new_data: pd.DataFrame):
@@ -643,7 +726,7 @@ class RealTimeTrader:
             self.entry_price = current_price
             transaction_cost = current_price * self.config.transaction_cost
             print(
-                f"BUY: {self.symbol} at ${current_price:.2f} (Cost: ${transaction_cost:.2f})")
+                f"BUY: {self.symbol} at ${current_price:.4f} (Cost: ${transaction_cost:.2f})")
 
         elif action == 2 and self.position == 1:  # Sell signal
             profit_pct = (current_price - self.entry_price) / self.entry_price
@@ -665,7 +748,7 @@ class RealTimeTrader:
 
             self.trade_history.append(trade_info)
 
-            print(f"SELL: {self.symbol} at ${current_price:.2f}")
+            print(f"SELL: {self.symbol} at ${current_price:.4f}")
             print(f"Profit: {profit_pct:.2%} (${profit_amount:.2f})")
             print(f"New Balance: ${self.balance:.2f}")
 
@@ -721,7 +804,7 @@ class RealTimeTrader:
                                 state, training=False)
                             action_names = ['HOLD', 'BUY', 'SELL']
 
-                            print(f"[{current_minute}] Price: ${current_price:.2f}, "
+                            print(f"[{current_minute}] Price: ${current_price:.4f}, "
                                   f"Action: {action_names[action]}, "
                                   f"Position: {'LONG' if self.position == 1 else 'NONE'}")
 
@@ -755,16 +838,88 @@ class RealTimeTrader:
             print(f"Win Rate: {win_rate:.2%}")
 
 
-def fetch_crypto_data(symbol: str = "BTC-USD", period: str = "7d", interval: str = "1m") -> pd.DataFrame:
-    """Fetch cryptocurrency data from Yahoo Finance"""
+def fetch_crypto_data(symbol: str = "BTC/USDT", exchange_name: str = "binance", timeframe: str = "1m", days: int = 7) -> pd.DataFrame:
+    """Fetch cryptocurrency data using CCXT"""
     try:
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period=period, interval=interval)
-        data.reset_index(inplace=True)
-        data.columns = ['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
-        return data
+        # Initialize exchange
+        exchange_class = getattr(ccxt, exchange_name)
+        exchange = exchange_class({
+            'timeout': 30000,
+            'enableRateLimit': True,
+        })
+
+        # Load markets
+        exchange.load_markets()
+
+        # Calculate the start timestamp
+        since = exchange.milliseconds() - (days * 24 * 60 * 60 * 1000)
+
+        # Fetch OHLCV data
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since)
+
+        if not ohlcv:
+            return None
+
+        # Convert to DataFrame
+        df = pd.DataFrame(
+            ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+
+        # Convert timestamp to datetime
+        df['Datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        # Drop timestamp column and reorder
+        df = df[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+        print(f"Fetched {len(df)} data points from {exchange_name}")
+        return df
+
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Error fetching data from {exchange_name}: {e}")
+
+        # Try alternative exchanges
+        alternative_exchanges = ['binance', 'coinbase', 'kraken', 'bitfinex']
+        for alt_exchange in alternative_exchanges:
+            if alt_exchange != exchange_name:
+                try:
+                    print(f"Trying {alt_exchange}...")
+                    return fetch_crypto_data(symbol, alt_exchange, timeframe, days)
+                except:
+                    continue
+
+        return None
+
+
+def load_user_data(file_path: str) -> pd.DataFrame:
+    """Load user-provided CSV data"""
+    try:
+        df = pd.read_csv(file_path)
+
+        # Try to standardize column names
+        column_mapping = {
+            'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close',
+            'volume': 'Volume', 'timestamp': 'Datetime', 'datetime': 'Datetime',
+            'time': 'Datetime', 'date': 'Datetime'
+        }
+
+        df.columns = [column_mapping.get(col.lower(), col)
+                      for col in df.columns]
+
+        # Ensure required columns exist
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in df.columns for col in required_columns):
+            print(f"Missing required columns. Found: {df.columns.tolist()}")
+            print(f"Required: {required_columns}")
+            return None
+
+        # Convert datetime if exists
+        if 'Datetime' in df.columns:
+            df['Datetime'] = pd.to_datetime(df['Datetime'])
+
+        print(f"Loaded {len(df)} data points from {file_path}")
+        return df
+
+    except Exception as e:
+        print(f"Error loading user data: {e}")
         return None
 
 
@@ -820,7 +975,7 @@ def main():
 
     # Fetch data
     print("Fetching cryptocurrency data...")
-    raw_data = fetch_crypto_data("BTC-USD", period="30d", interval="1m")
+    raw_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 7)
 
     if raw_data is None:
         print("Failed to fetch data. Exiting.")
@@ -881,8 +1036,7 @@ def main():
 
     # Demonstrate continuous learning
     print("\nDemonstrating continuous learning...")
-    new_data = fetch_crypto_data(
-        "BTC/USDT", period_days=1, exchange_name="binance")
+    new_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 1)
     if new_data is not None:
         new_processed = feature_engineer.engineer_features(new_data)
         new_normalized = feature_engineer.normalize_features(
@@ -893,9 +1047,8 @@ def main():
         trader.continuous_learning_update(new_feature_df)
         print("Model updated with new data!")
 
+
 # Training script function
-
-
 def train_model(user_data_path: str = None, episodes: int = 1000, model_save_path: str = "crypto_rl_model.pth"):
     """Dedicated training function"""
     print("="*50)
@@ -911,11 +1064,10 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
         raw_data = load_user_data(user_data_path)
         if raw_data is None:
             print("Failed to load user data. Falling back to default data source.")
-            raw_data = fetch_crypto_data(
-                "BTC-USD", period="30d", interval="1m")
+            raw_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 7)
     else:
         print("Fetching default cryptocurrency data...")
-        raw_data = fetch_crypto_data("BTC-USD", period="30d", interval="1m")
+        raw_data = fetch_crypto_data("BTC/USDT", "binance", "1m", 7)
 
     if raw_data is None:
         print("Failed to fetch data. Exiting.")
@@ -985,11 +1137,11 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
 
     return trader, feature_columns
 
+
 # Live trading script function
-
-
 def run_live_trading(model_path: str = "crypto_rl_model.pth",
-                     symbol: str = "BTC-USD",
+                     symbol: str = "BTC/USDT",
+                     exchange: str = "binance",
                      duration_minutes: int = 60):
     """Run live trading with trained model"""
     print("="*50)
@@ -1009,12 +1161,12 @@ def run_live_trading(model_path: str = "crypto_rl_model.pth",
 
     # Initialize real-time trader
     config = TradingConfig()
-    rt_trader = RealTimeTrader(model_path, symbol, config)
+    rt_trader = RealTimeTrader(model_path, symbol, exchange, config)
     rt_trader.load_model(feature_columns)
 
     # Warm up with historical data
     print("Warming up with historical data...")
-    warmup_data = fetch_crypto_data(symbol, period="1d", interval="1m")
+    warmup_data = rt_trader.fetch_historical_data("1m", 1)
     if warmup_data is not None:
         rt_trader.update_data_buffer(warmup_data)
         print(f"Loaded {len(warmup_data)} minutes of warmup data")
@@ -1029,11 +1181,11 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
         print(
-            "  Training: python crypto_rl_trader.py train [data_file.csv] [episodes]")
+            "  Training: python crypto_rl_trader.py train [data_file.csv] [episodes] [model_file.pth]")
         print(
-            "  Live Trading: python crypto_rl_trader.py trade [model_file.pth] [symbol] [duration_minutes]")
+            "  Live Trading: python crypto_rl_trader.py trade [model_file.pth] [symbol] [exchange] [duration_minutes]")
         print("  Example: python crypto_rl_trader.py train my_data.csv 1500")
-        print("  Example: python crypto_rl_trader.py trade crypto_rl_model.pth BTC-USD 120")
+        print("  Example: python crypto_rl_trader.py trade crypto_rl_model.pth BTC/USDT binance 120")
         sys.exit(1)
 
     mode = sys.argv[1].lower()
@@ -1050,10 +1202,11 @@ if __name__ == "__main__":
     elif mode == "trade":
         model_path = sys.argv[2] if len(
             sys.argv) > 2 else "crypto_rl_model.pth"
-        symbol = sys.argv[3] if len(sys.argv) > 3 else "BTC-USD"
-        duration = int(sys.argv[4]) if len(sys.argv) > 4 else 60
+        symbol = sys.argv[3] if len(sys.argv) > 3 else "BTC/USDT"
+        exchange = sys.argv[4] if len(sys.argv) > 4 else "binance"
+        duration = int(sys.argv[5]) if len(sys.argv) > 5 else 60
 
-        run_live_trading(model_path, symbol, duration)
+        run_live_trading(model_path, symbol, exchange, duration)
 
     else:
         print(f"Unknown mode: {mode}. Use 'train' or 'trade'.")

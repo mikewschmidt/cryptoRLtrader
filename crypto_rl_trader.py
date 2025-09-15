@@ -18,14 +18,20 @@ import talib
 import ccxt
 import time
 from datetime import datetime, timedelta
+import multiprocessing as mp
+import threading
+from queue import Queue, Empty
+import pickle
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 
+# Set multiprocessing start method
+mp.set_start_method('spawn', force=True)
 
 # Set the number of threads for PyTorch operations
-# You can also manually set this to a specific number, e.g., torch.set_num_threads(4)
-torch.set_num_threads(os.cpu_count())
+# Leave some cores for multiprocessing
+torch.set_num_threads(max(1, os.cpu_count() // 2))
 
 
 @dataclass
@@ -38,6 +44,17 @@ class TradingConfig:
     max_position_size: float = 1.0
     transaction_cost: float = 0.001  # 0.1% transaction cost
     initial_balance: float = 10000.0  # Initial portfolio balance
+
+    # Multiprocessing parameters
+    num_workers: int = 4  # Number of parallel workers
+    experience_batch_size: int = 64  # Experiences per worker batch
+    queue_maxsize: int = 1000  # Maximum queue size
+
+    # GPU optimization parameters
+    gpu_batch_size: int = 512  # Larger batch size for GPU efficiency
+    gpu_buffer_size: int = 50000  # Larger buffer for GPU batching
+    mixed_precision: bool = True  # Use mixed precision training
+    dataloader_workers: int = 2  # DataLoader workers for GPU feeding
 
 
 class TechnicalIndicators:
@@ -137,7 +154,7 @@ class FeatureEngineer:
 
 
 class ReplayBuffer:
-    """Experience replay buffer for storing and sampling experiences"""
+    """Thread-safe experience replay buffer for storing and sampling experiences"""
 
     def __init__(self, capacity: int, alpha: float = 0.6):
         self.capacity = capacity
@@ -145,38 +162,53 @@ class ReplayBuffer:
         self.priorities = deque(maxlen=capacity)
         self.alpha = alpha
         self.max_priority = 1.0
+        self.lock = threading.Lock()
 
     def add(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool, td_error: float = 1.0):
         """Add experience to buffer with priority"""
-        experience = (state, action, reward, next_state, done)
-        self.buffer.append(experience)
-        priority = (abs(td_error) + 1e-6) ** self.alpha
-        self.priorities.append(priority)
-        self.max_priority = max(self.max_priority, priority)
+        with self.lock:
+            experience = (state, action, reward, next_state, done)
+            self.buffer.append(experience)
+            priority = (abs(td_error) + 1e-6) ** self.alpha
+            self.priorities.append(priority)
+            self.max_priority = max(self.max_priority, priority)
+
+    def add_batch(self, experiences: List[Tuple]):
+        """Add batch of experiences to buffer"""
+        with self.lock:
+            for exp in experiences:
+                state, action, reward, next_state, done, td_error = exp
+                experience = (state, action, reward, next_state, done)
+                self.buffer.append(experience)
+                priority = (abs(td_error) + 1e-6) ** self.alpha
+                self.priorities.append(priority)
+                self.max_priority = max(self.max_priority, priority)
 
     def sample(self, batch_size: int, beta: float = 0.4) -> Tuple[List, np.ndarray]:
         """Sample batch with prioritized experience replay"""
-        if len(self.buffer) < batch_size:
-            return [], np.array([])
+        with self.lock:
+            if len(self.buffer) < batch_size:
+                return [], np.array([])
 
-        # Calculate sampling probabilities
-        priorities = np.array(self.priorities)
-        probs = priorities / np.sum(priorities)
+            # Calculate sampling probabilities
+            priorities = np.array(self.priorities)
+            probs = priorities / np.sum(priorities)
 
-        # Sample indices
-        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+            # Sample indices
+            indices = np.random.choice(len(self.buffer), batch_size, p=probs)
 
-        # Get experiences
-        experiences = [self.buffer[i] for i in indices]
+            # Get experiences
+            experiences = [self.buffer[i] for i in indices]
 
-        # Calculate importance sampling weights
-        weights = (len(self.buffer) * probs[indices]) ** (-beta)
-        weights /= np.max(weights)
+            # Calculate importance sampling weights
+            weights = (len(self.buffer) * probs[indices]) ** (-beta)
+            weights /= np.max(weights)
 
-        return experiences, weights
+            return experiences, weights
 
     def __len__(self):
-        return len(self.buffer)
+        with self.lock:
+            return len(self.buffer)
 
 
 class DQN(nn.Module):
@@ -200,6 +232,64 @@ class DQN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
+
+
+class AdvancedDQN(nn.Module):
+    """Advanced DQN with Dueling architecture for better GPU utilization"""
+
+    def __init__(self, state_size: int, action_size: int, hidden_layers: List[int] = [512, 512, 256, 128]):
+        super(AdvancedDQN, self).__init__()
+
+        # Shared feature extractor
+        feature_layers = []
+        prev_size = state_size
+
+        for hidden_size in hidden_layers[:-1]:
+            feature_layers.append(nn.Linear(prev_size, hidden_size))
+            feature_layers.append(nn.LayerNorm(hidden_size))
+            feature_layers.append(nn.ReLU())
+            feature_layers.append(nn.Dropout(0.3))
+            prev_size = hidden_size
+
+        self.feature_extractor = nn.Sequential(*feature_layers)
+
+        # Dueling architecture
+        final_hidden = hidden_layers[-1]
+
+        # Value stream
+        self.value_stream = nn.Sequential(
+            nn.Linear(prev_size, final_hidden),
+            nn.LayerNorm(final_hidden),
+            nn.ReLU(),
+            nn.Linear(final_hidden, 1)
+        )
+
+        # Advantage stream
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(prev_size, final_hidden),
+            nn.LayerNorm(final_hidden),
+            nn.ReLU(),
+            nn.Linear(final_hidden, action_size)
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Initialize weights for better GPU performance"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.feature_extractor(x)
+
+        value = self.value_stream(features)
+        advantage = self.advantage_stream(features)
+
+        # Combine value and advantage
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        return q_values
 
 
 class TradingEnvironment:
@@ -324,111 +414,326 @@ class TradingEnvironment:
         return self._get_state(), reward, done, info
 
 
-class CryptoRLTrader:
-    """Main RL trader class with continuous learning capabilities"""
+def run_worker(worker_id: int, data_chunk: pd.DataFrame, config: TradingConfig,
+               experience_queue: mp.Queue, episodes_per_worker: int, state_size: int):
+    """Worker function to generate experiences in parallel"""
+    try:
+        # Create local environment and simple policy for experience generation
+        env = TradingEnvironment(data_chunk, config)
 
-    def __init__(self, state_size: int, action_size: int = 3, config: TradingConfig = None):
+        print(
+            f"Worker {worker_id} starting with {len(data_chunk)} data points")
+
+        for episode in range(episodes_per_worker):
+            state = env.reset()
+            episode_experiences = []
+
+            while True:
+                # Simple epsilon-greedy action selection for experience generation
+                if random.random() < 0.3:  # 30% exploration
+                    action = random.randint(0, 2)
+                else:
+                    # Simple heuristic policy based on basic indicators
+                    if len(env.data) > env.current_step:
+                        close_price = env.data.iloc[env.current_step]['Close']
+                        if env.current_step > 0:
+                            prev_close = env.data.iloc[env.current_step - 1]['Close']
+                            if close_price > prev_close * 1.01:  # Price up 1%
+                                action = 1  # Buy
+                            elif close_price < prev_close * 0.99:  # Price down 1%
+                                action = 2  # Sell
+                            else:
+                                action = 0  # Hold
+                        else:
+                            action = 0
+                    else:
+                        action = 0
+
+                next_state, reward, done, info = env.step(action)
+
+                # Calculate simple TD error estimate
+                td_error = abs(reward) + 0.1
+
+                experience = (state.copy(), action, reward,
+                              next_state.copy(), done, td_error)
+                episode_experiences.append(experience)
+
+                state = next_state
+
+                if done:
+                    break
+
+            # Send experiences to queue in batches
+            if episode_experiences:
+                try:
+                    experience_queue.put(
+                        (worker_id, episode_experiences), timeout=1.0)
+                except:
+                    pass  # Queue might be full, skip this batch
+
+            if episode % 10 == 0:
+                print(
+                    f"Worker {worker_id} completed episode {episode}/{episodes_per_worker}")
+
+        print(f"Worker {worker_id} completed all episodes")
+
+    except Exception as e:
+        print(f"Worker {worker_id} error: {e}")
+
+
+class MultiprocessingCryptoRLTrader:
+    """Main RL trader class with multiprocessing and GPU optimization capabilities"""
+
+    def __init__(self, state_size: int, action_size: int = 3, config: TradingConfig = None, use_advanced_dqn: bool = True):
         self.state_size = state_size
         self.action_size = action_size
         self.config = config or TradingConfig()
+        self.use_advanced_dqn = use_advanced_dqn
 
-        # Neural networks
+        # GPU optimization
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
-        self.q_network = DQN(state_size, action_size).to(self.device)
-        self.target_network = DQN(state_size, action_size).to(self.device)
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=0.001)
+        print(f"Using device: {self.device}")
 
-        # Replay buffer
-        self.memory = ReplayBuffer(capacity=100000)
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name()}")
+            print(
+                f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            # Optimize GPU memory allocation
+            torch.backends.cudnn.benchmark = True
+            torch.cuda.empty_cache()
 
-        # Training parameters
+        # Neural networks - larger for better GPU utilization
+        if use_advanced_dqn:
+            self.q_network = AdvancedDQN(
+                state_size, action_size).to(self.device)
+            self.target_network = AdvancedDQN(
+                state_size, action_size).to(self.device)
+        else:
+            self.q_network = DQN(state_size, action_size).to(self.device)
+            self.target_network = DQN(state_size, action_size).to(self.device)
+
+        # Mixed precision training for better GPU utilization
+        self.use_mixed_precision = self.config.mixed_precision and torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
+
+        # Optimizers with better GPU settings
+        self.optimizer = optim.AdamW(
+            self.q_network.parameters(),
+            lr=0.001,
+            weight_decay=1e-4,
+            eps=1e-4  # Better for mixed precision
+        )
+
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.8, patience=100
+        )
+
+        # Larger replay buffer for GPU batching
+        self.memory = ReplayBuffer(capacity=self.config.gpu_buffer_size)
+
+        # Training parameters optimized for GPU
         self.epsilon = 1.0
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
-        self.batch_size = 32
-        self.update_target_freq = 1000
-        self.learn_freq = 4
+        self.batch_size = self.config.gpu_batch_size  # Much larger batch size
+        self.update_target_freq = 500  # More frequent updates with larger batches
+        self.learn_freq = 2  # More frequent learning
         self.step_count = 0
 
         # Performance tracking
         self.training_rewards = []
         self.training_losses = []
         self.performance_history = []
+        self.gpu_utilization = []
+
+        # Multiprocessing
+        self.experience_queue = mp.Queue(maxsize=self.config.queue_maxsize)
+        self.workers = []
+        self.experience_collector_thread = None
+        self.training_active = False
+
+        # GPU batch processing
+        self.experience_buffer = []
+        self.buffer_lock = threading.Lock()
 
         # Update target network
         self.update_target_network()
+
+        # Print model info
+        total_params = sum(p.numel() for p in self.q_network.parameters())
+        trainable_params = sum(
+            p.numel() for p in self.q_network.parameters() if p.requires_grad)
+        print(
+            f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+        print(f"Batch size: {self.batch_size}")
+        print(f"Mixed precision: {self.use_mixed_precision}")
 
     def update_target_network(self):
         """Update target network with main network weights"""
         self.target_network.load_state_dict(self.q_network.state_dict())
 
     def get_action(self, state: np.ndarray, training: bool = True) -> int:
-        """Get action using epsilon-greedy policy"""
+        """Get action using epsilon-greedy policy with GPU optimization"""
         if training and random.random() < self.epsilon:
             return random.randint(0, self.action_size - 1)
 
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        q_values = self.q_network(state_tensor)
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(
+                0).to(self.device, non_blocking=True)
+
+            if self.use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    q_values = self.q_network(state_tensor)
+            else:
+                q_values = self.q_network(state_tensor)
+
         return q_values.argmax().item()
+
+    def get_action_batch(self, states: np.ndarray) -> np.ndarray:
+        """Batch action prediction for better GPU utilization"""
+        with torch.no_grad():
+            states_tensor = torch.FloatTensor(states).to(
+                self.device, non_blocking=True)
+
+            if self.use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    q_values = self.q_network(states_tensor)
+            else:
+                q_values = self.q_network(states_tensor)
+
+        return q_values.argmax(dim=1).cpu().numpy()
 
     def remember(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
         """Store experience in replay buffer"""
         # Calculate TD error for prioritized replay
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(
-                state).unsqueeze(0).to(self.device)
-            next_state_tensor = torch.FloatTensor(
-                next_state).unsqueeze(0).to(self.device)
+            state_tensor = torch.FloatTensor(state).unsqueeze(
+                0).to(self.device, non_blocking=True)
+            next_state_tensor = torch.FloatTensor(next_state).unsqueeze(
+                0).to(self.device, non_blocking=True)
 
-            current_q = self.q_network(state_tensor)[0][action]
-            if done:
-                target_q = reward
+            if self.use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    current_q = self.q_network(state_tensor)[0][action]
+                    if not done:
+                        next_q = self.target_network(
+                            next_state_tensor).max(1)[0]
+                        target_q = reward + 0.99 * next_q
+                    else:
+                        target_q = reward
             else:
-                next_q = self.target_network(next_state_tensor).max(1)[0]
-                target_q = reward + 0.99 * next_q
+                current_q = self.q_network(state_tensor)[0][action]
+                if not done:
+                    next_q = self.target_network(next_state_tensor).max(1)[0]
+                    target_q = reward + 0.99 * next_q
+                else:
+                    target_q = reward
 
             td_error = abs(current_q - target_q).item()
 
         self.memory.add(state, action, reward, next_state, done, td_error)
 
+    def experience_collector(self):
+        """Collect experiences from worker processes with GPU optimization"""
+        print("GPU-optimized experience collector thread started")
+
+        while self.training_active:
+            try:
+                # Get experience batch from queue
+                worker_id, experiences = self.experience_queue.get(timeout=1.0)
+
+                with self.buffer_lock:
+                    self.experience_buffer.extend(experiences)
+
+                    # Process in larger batches for GPU efficiency
+                    if len(self.experience_buffer) >= self.batch_size:
+                        batch_to_add = self.experience_buffer[:self.batch_size]
+                        self.experience_buffer = self.experience_buffer[self.batch_size:]
+
+                        # Add batch to replay buffer
+                        self.memory.add_batch(batch_to_add)
+
+                        print(f"GPU batch processed: {len(batch_to_add)} experiences, "
+                              f"Buffer size: {len(self.memory)}")
+
+            except:
+                continue  # Timeout or queue empty
+
+        print("Experience collector thread stopped")
+
     def replay(self) -> float:
-        """Train the model on a batch of experiences"""
+        """GPU-optimized training on batch of experiences"""
         if len(self.memory) < self.batch_size:
             return 0
 
-        # Sample batch from replay buffer
+        # Sample larger batch for GPU efficiency
         experiences, weights = self.memory.sample(self.batch_size)
 
-        states = torch.FloatTensor([e[0] for e in experiences]).to(self.device)
-        actions = torch.LongTensor([e[1] for e in experiences]).to(self.device)
-        rewards = torch.FloatTensor(
-            [e[2] for e in experiences]).to(self.device)
-        next_states = torch.FloatTensor(
-            [e[3] for e in experiences]).to(self.device)
-        dones = torch.BoolTensor([e[4] for e in experiences]).to(self.device)
-        weights_tensor = torch.FloatTensor(weights).to(self.device)
+        if not experiences:
+            return 0
 
-        # Current Q values
-        current_q_values = self.q_network(
-            states).gather(1, actions.unsqueeze(1))
+        # Prepare tensors for GPU with non_blocking transfer
+        states = torch.FloatTensor([e[0] for e in experiences]).to(
+            self.device, non_blocking=True)
+        actions = torch.LongTensor([e[1] for e in experiences]).to(
+            self.device, non_blocking=True)
+        rewards = torch.FloatTensor([e[2] for e in experiences]).to(
+            self.device, non_blocking=True)
+        next_states = torch.FloatTensor([e[3] for e in experiences]).to(
+            self.device, non_blocking=True)
+        dones = torch.BoolTensor([e[4] for e in experiences]).to(
+            self.device, non_blocking=True)
+        weights_tensor = torch.FloatTensor(
+            weights).to(self.device, non_blocking=True)
 
-        # Next Q values from target network
-        with torch.no_grad():
-            next_q_values = self.target_network(next_states).max(1)[0]
-            target_q_values = rewards + (0.99 * next_q_values * ~dones)
+        # Forward pass with mixed precision
+        if self.use_mixed_precision:
+            with torch.cuda.amp.autocast():
+                # Current Q values
+                current_q_values = self.q_network(
+                    states).gather(1, actions.unsqueeze(1))
 
-        # Calculate loss with importance sampling weights
-        loss = F.mse_loss(current_q_values.squeeze(),
-                          target_q_values, reduction='none')
-        weighted_loss = (loss * weights_tensor).mean()
+                # Next Q values from target network
+                with torch.no_grad():
+                    next_q_values = self.target_network(next_states).max(1)[0]
+                    target_q_values = rewards + (0.99 * next_q_values * ~dones)
 
-        # Optimize
-        self.optimizer.zero_grad()
-        weighted_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.q_network.parameters(), max_norm=1.0)
-        self.optimizer.step()
+                # Calculate loss with importance sampling weights
+                loss = F.mse_loss(current_q_values.squeeze(),
+                                  target_q_values, reduction='none')
+                weighted_loss = (loss * weights_tensor).mean()
+
+            # Backward pass with gradient scaling
+            self.optimizer.zero_grad()
+            self.scaler.scale(weighted_loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.q_network.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Regular precision training
+            current_q_values = self.q_network(
+                states).gather(1, actions.unsqueeze(1))
+
+            with torch.no_grad():
+                next_q_values = self.target_network(next_states).max(1)[0]
+                target_q_values = rewards + (0.99 * next_q_values * ~dones)
+
+            loss = F.mse_loss(current_q_values.squeeze(),
+                              target_q_values, reduction='none')
+            weighted_loss = (loss * weights_tensor).mean()
+
+            self.optimizer.zero_grad()
+            weighted_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.q_network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+        # Update learning rate based on loss
+        self.scheduler.step(weighted_loss.item())
 
         # Update epsilon
         if self.epsilon > self.epsilon_min:
@@ -436,59 +741,148 @@ class CryptoRLTrader:
 
         return weighted_loss.item()
 
-    def train(self, env: TradingEnvironment, episodes: int, save_path: str = "crypto_rl_model.pth"):
-        """Train the RL agent"""
+    def start_workers(self, train_data: pd.DataFrame, episodes: int):
+        """Start worker processes for experience generation"""
+        print(f"Starting {self.config.num_workers} workers...")
+
+        # Split data among workers
+        data_splits = np.array_split(train_data, self.config.num_workers)
+        episodes_per_worker = episodes // self.config.num_workers
+
+        self.training_active = True
+
+        # Start experience collector thread
+        self.experience_collector_thread = threading.Thread(
+            target=self.experience_collector, daemon=True)
+        self.experience_collector_thread.start()
+
+        # Start worker processes
+        for i in range(self.config.num_workers):
+            worker = mp.Process(
+                target=run_worker,
+                args=(i, data_splits[i], self.config, self.experience_queue,
+                      episodes_per_worker, self.state_size),
+                daemon=True
+            )
+            worker.start()
+            self.workers.append(worker)
+
+        print(f"Started {len(self.workers)} worker processes")
+
+    def stop_workers(self):
+        """Stop all worker processes"""
+        print("Stopping workers...")
+
+        self.training_active = False
+
+        # Terminate worker processes
+        for worker in self.workers:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5)
+
+        # Join experience collector thread
+        if self.experience_collector_thread and self.experience_collector_thread.is_alive():
+            self.experience_collector_thread.join(timeout=5)
+
+        self.workers.clear()
+        print("All workers stopped")
+
+    def train(self, train_data: pd.DataFrame, episodes: int, save_path: str = "crypto_rl_model.pth"):
+        """Train the RL agent with multiprocessing"""
+        print(f"Starting multiprocessing training with {episodes} episodes...")
+
         best_reward = float('-inf')
+        training_start_time = time.time()
 
-        for episode in range(episodes):
-            state = env.reset()
-            episode_reward = 0
-            episode_loss = 0
-            steps = 0
+        try:
+            # Start worker processes
+            self.start_workers(train_data, episodes)
 
-            while True:
-                action = self.get_action(state, training=True)
-                next_state, reward, done, info = env.step(action)
+            # Training loop
+            print("Waiting for initial experiences...")
 
-                self.remember(state, action, reward, next_state, done)
-                episode_reward += reward
+            # Wait for some initial experiences
+            while len(self.memory) < self.batch_size * 4:
+                time.sleep(1)
+                print(f"Buffer size: {len(self.memory)}")
+
+            print("Starting model training...")
+
+            training_steps = 0
+            last_save_time = time.time()
+
+            # Train while workers are generating experiences
+            while any(worker.is_alive() for worker in self.workers) or not self.experience_queue.empty():
 
                 # Train the model
-                if self.step_count % self.learn_freq == 0:
+                if len(self.memory) >= self.batch_size:
                     loss = self.replay()
-                    episode_loss += loss
+                    self.training_losses.append(loss)
+                    training_steps += 1
 
-                # Update target network
-                if self.step_count % self.update_target_freq == 0:
-                    self.update_target_network()
+                    # Update target network
+                    if training_steps % self.update_target_freq == 0:
+                        self.update_target_network()
+                        print(
+                            f"Target network updated at step {training_steps}")
 
-                state = next_state
-                self.step_count += 1
-                steps += 1
+                    # Periodic progress update
+                    if training_steps % 100 == 0:
+                        avg_loss = np.mean(
+                            self.training_losses[-100:]) if self.training_losses else 0
+                        elapsed_time = time.time() - training_start_time
+                        print(f"Training step {training_steps}, Avg Loss: {avg_loss:.4f}, "
+                              f"Buffer size: {len(self.memory)}, Epsilon: {self.epsilon:.4f}, "
+                              f"Elapsed: {elapsed_time:.1f}s")
 
-                if done:
-                    break
+                # Save model periodically
+                if time.time() - last_save_time > 300:  # Every 5 minutes
+                    self.save_model(save_path.replace(
+                        '.pth', '_checkpoint.pth'))
+                    last_save_time = time.time()
 
-            self.training_rewards.append(episode_reward)
-            self.training_losses.append(
-                episode_loss / steps if steps > 0 else 0)
+                time.sleep(0.01)  # Small delay to prevent CPU spinning
 
-            # Save best model
-            if episode_reward > best_reward:
-                best_reward = episode_reward
-                torch.save({
-                    'q_network_state_dict': self.q_network.state_dict(),
-                    'target_network_state_dict': self.target_network.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'epsilon': self.epsilon,
-                    'step_count': self.step_count
-                }, save_path)
+            print("All workers completed. Finishing training...")
 
-            if episode % 100 == 0:
-                avg_reward = np.mean(self.training_rewards[-100:])
-                avg_loss = np.mean(self.training_losses[-100:])
-                print(f"Episode {episode}, Avg Reward: {avg_reward:.4f}, Avg Loss: {avg_loss:.4f}, "
-                      f"Epsilon: {self.epsilon:.4f}, Balance: {env.balance:.2f}")
+            # Continue training on remaining experiences
+            final_training_steps = 0
+            while len(self.memory) >= self.batch_size and final_training_steps < 1000:
+                loss = self.replay()
+                self.training_losses.append(loss)
+                final_training_steps += 1
+
+                if final_training_steps % 100 == 0:
+                    avg_loss = np.mean(self.training_losses[-100:])
+                    print(
+                        f"Final training step {final_training_steps}, Loss: {avg_loss:.4f}")
+
+            # Save final model
+            self.save_model(save_path)
+
+            total_time = time.time() - training_start_time
+            print(f"Training completed in {total_time:.1f}s")
+            print(
+                f"Total training steps: {training_steps + final_training_steps}")
+            print(f"Final buffer size: {len(self.memory)}")
+
+        except Exception as e:
+            print(f"Training error: {e}")
+            raise
+        finally:
+            self.stop_workers()
+
+    def save_model(self, path: str):
+        """Save model state"""
+        torch.save({
+            'q_network_state_dict': self.q_network.state_dict(),
+            'target_network_state_dict': self.target_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'step_count': self.step_count,
+            'training_losses': self.training_losses
+        }, path)
 
     def load_model(self, path: str):
         """Load trained model"""
@@ -499,6 +893,7 @@ class CryptoRLTrader:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.epsilon = checkpoint.get('epsilon', 0.01)
         self.step_count = checkpoint.get('step_count', 0)
+        self.training_losses = checkpoint.get('training_losses', [])
 
     def evaluate(self, env: TradingEnvironment) -> Dict:
         """Evaluate the trained model"""
@@ -632,7 +1027,7 @@ class RealTimeTrader:
         self.feature_columns = feature_columns
         state_size = len(feature_columns) + 3
 
-        self.trader = CryptoRLTrader(
+        self.trader = MultiprocessingCryptoRLTrader(
             state_size, action_size=3, config=self.config)
         self.trader.load_model(self.model_path)
         print(f"Loaded trained model from {self.model_path}")
@@ -930,21 +1325,27 @@ def load_user_data(file_path: str) -> pd.DataFrame:
         return None
 
 
-def plot_results(trader: CryptoRLTrader, results: Dict):
+def plot_results(trader: MultiprocessingCryptoRLTrader, results: Dict):
     """Plot training and evaluation results"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-    # Training rewards
-    axes[0, 0].plot(trader.training_rewards)
-    axes[0, 0].set_title('Training Rewards')
-    axes[0, 0].set_xlabel('Episode')
-    axes[0, 0].set_ylabel('Reward')
-
     # Training losses
-    axes[0, 1].plot(trader.training_losses)
-    axes[0, 1].set_title('Training Losses')
-    axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].set_ylabel('Loss')
+    if trader.training_losses:
+        axes[0, 0].plot(trader.training_losses)
+        axes[0, 0].set_title('Training Losses')
+        axes[0, 0].set_xlabel('Training Step')
+        axes[0, 0].set_ylabel('Loss')
+
+    # Moving average of losses
+    if len(trader.training_losses) > 100:
+        window = 100
+        moving_avg = pd.Series(trader.training_losses).rolling(
+            window=window).mean()
+        axes[0, 1].plot(moving_avg)
+        axes[0, 1].set_title(
+            f'Training Loss (Moving Average, window={window})')
+        axes[0, 1].set_xlabel('Training Step')
+        axes[0, 1].set_ylabel('Loss')
 
     # Portfolio performance
     if results.get('trades'):
@@ -1003,6 +1404,10 @@ def main():
     """Main function to run the crypto trading RL model"""
     # Configuration
     config = TradingConfig()
+    # Use available cores minus 1
+    config.num_workers = min(4, max(1, os.cpu_count() - 1))
+
+    print(f"Using {config.num_workers} worker processes")
 
     # Fetch data
     print("Fetching cryptocurrency data...")
@@ -1038,18 +1443,18 @@ def main():
     print(f"Training data: {len(train_data)} samples")
     print(f"Testing data: {len(test_data)} samples")
 
-    # Create environments
-    train_env = TradingEnvironment(train_data, config)
+    # Create test environment
     test_env = TradingEnvironment(test_data, config)
 
-    # Initialize trader
+    # Initialize multiprocessing trader
     # +3 for position, balance ratio, steps since entry
     state_size = len(feature_columns) + 3
-    trader = CryptoRLTrader(state_size, action_size=3, config=config)
+    trader = MultiprocessingCryptoRLTrader(
+        state_size, action_size=3, config=config)
 
     # Train the model
-    print("Starting training...")
-    trader.train(train_env, episodes=1000, save_path="crypto_rl_model.pth")
+    print("Starting multiprocessing training...")
+    trader.train(train_data, episodes=1000, save_path="crypto_rl_model_mp.pth")
 
     # Evaluate the model
     print("Evaluating model...")
@@ -1075,19 +1480,31 @@ def main():
         new_feature_df = pd.DataFrame(new_normalized, columns=feature_columns)
         new_feature_df['Close'] = new_processed['Close'].values
 
-        trader.continuous_learning_update(new_feature_df, feature_columns)
+        trader.continuous_learning_update(new_feature_df)
         print("Model updated with new data!")
 
 
 # Training script function
-def train_model(user_data_path: str = None, episodes: int = 1000, model_save_path: str = "crypto_rl_model.pth"):
-    """Dedicated training function"""
-    print("="*50)
-    print("CRYPTOCURRENCY RL TRADING MODEL - TRAINING MODE")
-    print("="*50)
+def train_model(user_data_path: str = None, episodes: int = 1000, model_save_path: str = "crypto_rl_model_mp.pth", num_workers: int = None):
+    """Dedicated training function with multiprocessing"""
+    print("="*60)
+    print("MULTIPROCESSING CRYPTOCURRENCY RL TRADING MODEL - TRAINING MODE")
+    print("="*60)
 
     # Configuration
     config = TradingConfig()
+    if num_workers is None:
+        # Max out workers but leave 2 cores for system overhead
+        total_cores = os.cpu_count()
+        # Minimum 2 workers, leave 2 cores for overhead
+        config.num_workers = max(2, total_cores - 2)
+    else:
+        config.num_workers = num_workers
+
+    print(
+        f"System cores: {os.cpu_count()}, Using {config.num_workers} worker processes")
+    print(f"PyTorch threads: {torch.get_num_threads()}")
+    print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
 
     # Load data - user provided or default
     if user_data_path:
@@ -1133,29 +1550,40 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
     print(f"Testing data: {len(test_data)} samples")
 
     # Create environments
-    train_env = TradingEnvironment(train_data, config)
     test_env = TradingEnvironment(test_data, config)
 
-    # Initialize trader
+    # Initialize multiprocessing trader
     state_size = len(feature_columns) + 3
-    trader = CryptoRLTrader(state_size, action_size=3, config=config)
+    trader = MultiprocessingCryptoRLTrader(
+        state_size, action_size=3, config=config)
 
     # Train the model
-    print(f"Starting training for {episodes} episodes...")
-    trader.train(train_env, episodes=episodes, save_path=model_save_path)
+    print(f"Starting multiprocessing training for {episodes} episodes...")
+    start_time = time.time()
+
+    try:
+        trader.train(train_data, episodes=episodes, save_path=model_save_path)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving current model...")
+        trader.save_model(model_save_path.replace('.pth', '_interrupted.pth'))
+        return None
+
+    training_time = time.time() - start_time
 
     # Evaluate the model
     print("Evaluating model...")
     results = trader.evaluate(test_env)
 
-    print(f"\n" + "="*50)
-    print("TRAINING COMPLETE - EVALUATION RESULTS:")
-    print("="*50)
+    print(f"\n" + "="*60)
+    print("MULTIPROCESSING TRAINING COMPLETE - EVALUATION RESULTS:")
+    print("="*60)
+    print(f"Training Time: {training_time:.1f} seconds")
     print(f"Final Balance: ${results['final_balance']:.2f}")
     print(f"Total Return: {results['return_pct']:.2%}")
     print(f"Win Rate: {results['win_rate']:.2%}")
     print(f"Max Drawdown: {results['max_drawdown']:.2%}")
     print(f"Total Trades: {results['total_trades']}")
+    print(f"Training Steps: {len(trader.training_losses)}")
 
     # Save feature columns for later use
     feature_columns_path = model_save_path.replace('.pth', '_features.txt')
@@ -1173,14 +1601,14 @@ def train_model(user_data_path: str = None, episodes: int = 1000, model_save_pat
 
 
 # Live trading script function
-def run_live_trading(model_path: str = "crypto_rl_model.pth",
+def run_live_trading(model_path: str = "crypto_rl_model_mp.pth",
                      symbol: str = "BTC/USDT",
                      exchange: str = "coinbase",
                      duration_minutes: int = 60):
     """Run live trading with trained model"""
-    print("="*50)
-    print("CRYPTOCURRENCY RL TRADING MODEL - LIVE TRADING MODE")
-    print("="*50)
+    print("="*60)
+    print("MULTIPROCESSING CRYPTOCURRENCY RL TRADING MODEL - LIVE TRADING MODE")
+    print("="*60)
 
     # Load feature columns
     feature_columns_path = model_path.replace('.pth', '_features.txt')
@@ -1212,14 +1640,17 @@ def run_live_trading(model_path: str = "crypto_rl_model.pth",
 if __name__ == "__main__":
     import sys
 
+    # Ensure proper multiprocessing behavior
+    mp.freeze_support()
+
     if len(sys.argv) < 2:
         print("Usage:")
         print(
-            "  Training: python crypto_rl_trader.py train [data_file.csv] [episodes] [model_file.pth]")
+            "  Training: python crypto_rl_trader.py train [data_file.csv] [episodes] [model_file.pth] [num_workers]")
         print(
             "  Live Trading: python crypto_rl_trader.py trade [model_file.pth] [symbol] [exchange] [duration_minutes]")
-        print("  Example: python crypto_rl_trader.py train my_data.csv 1500")
-        print("  Example: python crypto_rl_trader.py trade crypto_rl_model.pth BTC/USDT coinbase 120")
+        print("  Example: python crypto_rl_trader.py train my_data.csv 2000 model.pth 6")
+        print("  Example: python crypto_rl_trader.py trade crypto_rl_model_mp.pth BTC/USDT coinbase 120")
         sys.exit(1)
 
     mode = sys.argv[1].lower()
@@ -1229,13 +1660,14 @@ if __name__ == "__main__":
             sys.argv) > 2 and sys.argv[2] != "default" else None
         episodes = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
         model_path = sys.argv[4] if len(
-            sys.argv) > 4 else "crypto_rl_model.pth"
+            sys.argv) > 4 else "crypto_rl_model_mp.pth"
+        num_workers = int(sys.argv[5]) if len(sys.argv) > 5 else None
 
-        train_model(data_file, episodes, model_path)
+        train_model(data_file, episodes, model_path, num_workers)
 
     elif mode == "trade":
         model_path = sys.argv[2] if len(
-            sys.argv) > 2 else "crypto_rl_model.pth"
+            sys.argv) > 2 else "crypto_rl_model_mp.pth"
         symbol = sys.argv[3] if len(sys.argv) > 3 else "BTC/USDT"
         exchange = sys.argv[4] if len(sys.argv) > 4 else "coinbase"
         duration = int(sys.argv[5]) if len(sys.argv) > 5 else 60

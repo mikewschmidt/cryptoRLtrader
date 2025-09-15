@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -20,6 +21,11 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
+
+
+# Set the number of threads for PyTorch operations
+# You can also manually set this to a specific number, e.g., torch.set_num_threads(4)
+torch.set_num_threads(os.cpu_count())
 
 
 @dataclass

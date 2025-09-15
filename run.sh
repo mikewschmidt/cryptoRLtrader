@@ -28,7 +28,8 @@ Episodes (Training Duration)
 #python crypto_rl_trader.py train default 500 test_model.pth
 
 #python crypto_rl_trader.py train 1_months_of_days_of_crypto_1m.csv 2000 test_model.pth
-python crypto_rl_trader.py train 3_months_of_days_of_crypto_1m.csv 2000 RL_model_2000_3month.pth
+python crypto_rl_trader.py train 3_months_of_days_of_crypto_1m.csv 5000 RL_model_5000_3month.pth
+python crypto_rl_trader.py train 3_months_of_days_of_crypto_1m.csv 1000 RL_model_1000_3month.pth
 
 
 # Calculate the end time
